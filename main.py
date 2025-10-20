@@ -1,12 +1,11 @@
 import os
-import re
-from flask import Flask, request, jsonify, Response
+from flask import Flask, jsonify
 from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore
 import requests
 import logging
-import json
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -53,102 +52,52 @@ def parse_cookies_for_header(cookie_string):
         return ''
     return '; '.join([f"{parts[5]}={parts[6]}" for line in cookie_string.strip().split('\n') if line.strip() and not line.strip().startswith('#') and len(parts := line.strip().split('\t')) == 7])
 
+# --- Updated Endpoint to Check Login Status ---
+@app.route('/check-login', methods=['GET'])
+def check_login():
+    app.logger.info("Received a login check request.")
+    
+    cookie_string = get_freepik_cookies()
+    if not cookie_string:
+        return jsonify({'status': 'error', 'message': 'Could not retrieve Freepik cookies from database.'}), 500
+
+    cookie_header = parse_cookies_for_header(cookie_string)
+    if not cookie_header:
+        return jsonify({'status': 'error', 'message': 'Failed to parse cookies.'}), 500
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+        'Cookie': cookie_header,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+    }
+
+    # We will go to a standard premium asset page to check the login status.
+    test_url = "https://www.freepik.com/premium-vector/cute-cartoon-cats-various-breeds_417256328.htm"
+    
+    try:
+        app.logger.info("Making request to a Freepik page to verify login status from HTML.")
+        response = requests.get(test_url, headers=headers)
+        response.raise_for_status() # Will throw an error for bad status codes like 4xx or 5xx
+
+        # --- NEW, MORE RELIABLE CHECK ---
+        # We search the returned HTML for `data-is-user-logged="true"`
+        if 'data-is-user-logged="true"' in response.text:
+            app.logger.info("Login check successful: Found 'data-is-user-logged=\"true\"' in HTML.")
+            return jsonify({'status': 'success', 'message': 'Successfully logged into Freepik account.'})
+        else:
+            app.logger.warning("Login check failed: 'data-is-user-logged=\"true\"' not found. Cookies may be invalid.")
+            return jsonify({'status': 'error', 'message': 'Login failed. The cookies appear to be invalid or expired.'}), 401
+        # --- End of New Check ---
+
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Request to Freepik failed: {e}")
+        return jsonify({'status': 'error', 'message': 'Failed to connect to Freepik.'}), 502
+
+# Health check for Render
 @app.route('/health')
 def health():
     return 'OK', 200
 
-@app.route('/download', methods=['POST'])
-def download():
-    app.logger.info("Received a download request.")
-    data = request.get_json()
-    freepik_url = data.get('freepikUrl')
-
-    if not freepik_url:
-        app.logger.warning("Request received without a Freepik URL.")
-        return jsonify({'error': 'Freepik URL is required.'}), 400
-
-    cookie_string = get_freepik_cookies()
-    if not cookie_string:
-        return jsonify({'error': 'Could not retrieve Freepik cookie from database.'}), 500
-    
-    cookie_header = parse_cookies_for_header(cookie_string)
-    if not cookie_header:
-        return jsonify({'error': 'Failed to parse cookies.'}), 500
-        
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-        'Cookie': cookie_header,
-        'Referer': freepik_url
-    }
-
-    try:
-        # --- First, get the page HTML to find the necessary IDs ---
-        app.logger.info(f"Fetching page HTML for URL: {freepik_url}")
-        page_response = requests.get(freepik_url, headers=headers)
-        page_response.raise_for_status()
-
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page_response.text)
-        if not match:
-            app.logger.error("Could not find __NEXT_DATA__ script tag in page source.")
-            return jsonify({'error': 'Could not parse page data. Site structure may have changed.'}), 500
-
-        next_data = json.loads(match.group(1))
-        
-        resource_id = next_data.get('props', {}).get('pageProps', {}).get('id')
-        wallet_id = next_data.get('props', {}).get('pageProps', {}).get('user', {}).get('wallet', {}).get('id')
-
-        if not resource_id or not wallet_id:
-            app.logger.error(f"Could not extract resource_id or wallet_id from page data.")
-            return jsonify({'error': 'Could not extract necessary download parameters.'}), 500
-            
-        app.logger.info(f"Extracted resource ID: {resource_id} and wallet ID: {wallet_id}")
-
-        # --- Use the API endpoint you discovered ---
-        api_url = f"https://www.freepik.com/api/regular/download"
-        payload = {
-            "resource": resource_id,
-            "action": "download",
-            "walletId": wallet_id,
-            "locale": "en"
-        }
-        
-        api_headers = headers.copy()
-        api_headers.update({
-            'Accept': 'application/json, text/plain, */*',
-            'Content-Type': 'application/json;charset=UTF-8',
-            'X-Requested-With': 'XMLHttpRequest',
-        })
-
-        app.logger.info(f"Making API call for resource {resource_id}")
-        api_response = requests.post(api_url, headers=api_headers, json=payload)
-        api_response.raise_for_status()
-        
-        response_data = api_response.json()
-        final_download_url = response_data.get('url')
-
-        if not final_download_url:
-            app.logger.error("API response did not contain a download URL.")
-            return jsonify({'error': 'Could not get download link from Freepik API.'}), 500
-            
-        app.logger.info("Successfully got final download URL.")
-
-        # --- Stream the file to the user ---
-        file_response = requests.get(final_download_url, stream=True)
-        file_response.raise_for_status()
-        
-        content_disposition = file_response.headers.get('content-disposition')
-        
-        return Response(file_response.iter_content(chunk_size=8192),
-                        content_type=file_response.headers['content-type'],
-                        headers={"Content-Disposition": content_disposition})
-
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"API request failed: {e}")
-        if e.response is not None:
-             app.logger.error(f"Response status: {e.response.status_code}")
-             app.logger.error(f"Response body: {e.response.text}")
-        return jsonify({'error': 'Failed to communicate with Freepik API. Cookies may be expired.'}), 502
-
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 3000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 3000)))
 
